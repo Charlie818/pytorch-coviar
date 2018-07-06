@@ -11,6 +11,7 @@ import random
 import numpy as np
 import torch
 import torch.utils.data as data
+import threading
 
 from coviar import get_num_frames
 from coviar import load
@@ -52,6 +53,72 @@ def get_gop_pos(frame_idx, representation):
         gop_pos = 0
     return gop_index, gop_pos
 
+def get_test_frame_index(num_frames, seg, representation, num_segments):
+    if representation in ['mv', 'residual']:
+        num_frames -= 1
+
+    seg_size = float(num_frames - 1) / num_segments
+    v_frame_idx = int(np.round(seg_size * (seg + 0.5)))
+
+    if representation in ['mv', 'residual']:
+        v_frame_idx += 1
+
+    return get_gop_pos(v_frame_idx, representation)
+
+def get_train_frame_index(num_frames, seg,representation,num_segments):
+    # Compute the range of the segment.
+    seg_begin, seg_end = get_seg_range(num_frames, num_segments, seg,
+                                             representation=representation)
+
+    # Sample one frame from the segment.
+    v_frame_idx = random.randint(seg_begin, seg_end - 1)
+    return get_gop_pos(v_frame_idx, representation)
+
+def load_segment(is_train,num_frames,seg,representation,num_segments,video_path,representation_idx,accumulate):
+    if is_train:
+        gop_index, gop_pos = get_train_frame_index(num_frames, seg, representation, num_segments)
+    else:
+        gop_index, gop_pos = get_test_frame_index(num_frames, seg, representation, num_segments)
+
+    img = load(video_path, gop_index, gop_pos,
+               representation_idx, accumulate)
+
+    if img is None:
+        print('Error: loading video %s failed.' % video_path)
+        img = np.zeros((256, 256, 2)) if representation == 'mv' else np.zeros((256, 256, 3))
+    else:
+        if representation == 'mv':
+            img = clip_and_scale(img, 20)
+            img += 128
+            img = (np.minimum(np.maximum(img, 0), 255)).astype(np.uint8)
+        elif representation == 'residual':
+            img += 128
+            img = (np.minimum(np.maximum(img, 0), 255)).astype(np.uint8)
+
+    if representation == 'iframe':
+        if is_train:
+            img = color_aug(img)
+
+        # BGR to RGB. (PyTorch uses RGB according to doc.)
+        img = img[..., ::-1]
+    return img
+
+class MyThread(threading.Thread):
+
+    def __init__(self, func, args=()):
+        super(MyThread, self).__init__()
+        self.func = func
+        self.args = args
+
+    def run(self):
+        self.result = self.func(*self.args)
+
+    def get_result(self):
+        try:
+            return self.result
+        except Exception:
+            return None
+
 
 class CoviarDataSet(data.Dataset):
     def __init__(self, data_root, data_name,
@@ -90,27 +157,6 @@ class CoviarDataSet(data.Dataset):
 
         print('%d videos loaded.' % len(self._video_list))
 
-    def _get_train_frame_index(self, num_frames, seg):
-        # Compute the range of the segment.
-        seg_begin, seg_end = get_seg_range(num_frames, self._num_segments, seg,
-                                                 representation=self._representation)
-
-        # Sample one frame from the segment.
-        v_frame_idx = random.randint(seg_begin, seg_end - 1)
-        return get_gop_pos(v_frame_idx, self._representation)
-
-    def _get_test_frame_index(self, num_frames, seg):
-        if self._representation in ['mv', 'residual']:
-            num_frames -= 1
-
-        seg_size = float(num_frames - 1) / self._num_segments
-        v_frame_idx = int(np.round(seg_size * (seg + 0.5)))
-
-        if self._representation in ['mv', 'residual']:
-            v_frame_idx += 1
-
-        return get_gop_pos(v_frame_idx, self._representation)
-
     def __getitem__(self, index):
 
         if self._representation == 'mv':
@@ -127,35 +173,15 @@ class CoviarDataSet(data.Dataset):
             video_path, label, num_frames = self._video_list[index]
 
         frames = []
+        threads=[]
         for seg in range(self._num_segments):
+            thread=MyThread(func=load_segment,args=(self._is_train,num_frames,seg,self._representation,self._num_segments,video_path,representation_idx,self._accumulate))
+            thread.start()
+            threads.append(thread)
 
-            if self._is_train:
-                gop_index, gop_pos = self._get_train_frame_index(num_frames, seg)
-            else:
-                gop_index, gop_pos = self._get_test_frame_index(num_frames, seg)
-
-            img = load(video_path, gop_index, gop_pos,
-                       representation_idx, self._accumulate)
-
-            if img is None:
-                print('Error: loading video %s failed.' % video_path)
-                img = np.zeros((256, 256, 2)) if self._representation == 'mv' else np.zeros((256, 256, 3))
-            else:
-                if self._representation == 'mv':
-                    img = clip_and_scale(img, 20)
-                    img += 128
-                    img = (np.minimum(np.maximum(img, 0), 255)).astype(np.uint8)
-                elif self._representation == 'residual':
-                    img += 128
-                    img = (np.minimum(np.maximum(img, 0), 255)).astype(np.uint8)
-
-            if self._representation == 'iframe':
-                img = color_aug(img)
-
-                # BGR to RGB. (PyTorch uses RGB according to doc.)
-                img = img[..., ::-1]
-
-            frames.append(img)
+        for thread in threads:
+            thread.join()
+            frames.append(thread.get_result())
 
         frames = self._transform(frames)
 
